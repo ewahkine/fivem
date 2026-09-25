@@ -181,7 +181,17 @@ private:
 
 	int EstimateCompressedSize(rl::MessageBuffer& buffer);
 
-	uint32_t& GetLastCommandBoundary(rl::MessageBuffer& buffer);
+	struct SendBufferState
+	{
+		// bit offset of the end of the last command known to fit in a single packet
+		uint32_t lastBoundary = 0;
+
+		// uncompressed length and estimated compressed size at the last estimate
+		size_t estimatedAtLength = 0;
+		int estimatedSize = 0;
+	};
+
+	SendBufferState& GetSendBufferState(rl::MessageBuffer& buffer);
 
 	void AttemptFlushCloneBuffer();
 
@@ -219,9 +229,8 @@ private:
 	rl::MessageBuffer m_sendBuffer{ 16384 };
 	rl::MessageBuffer m_ackBuffer{ 16384 };
 
-	// bit offset of the end of the last command known to fit in a single packet
-	uint32_t m_sendBufferBoundary = 0;
-	uint32_t m_ackBufferBoundary = 0;
+	SendBufferState m_sendBufferState;
+	SendBufferState m_ackBufferState;
 
 	uint32_t m_ackTimestamp{ 0 };
 
@@ -237,6 +246,11 @@ private:
 		std::shared_ptr<fx::StateBag> stateBag;
 		uint64_t lastFrameUpdated = 0;
 		bool hi = false;
+
+		// sampled position, used to estimate the entity's speed for sync rate decisions
+		float lastSamplePos[3] = { 0.0f, 0.0f, 0.0f };
+		uint32_t lastSampleTime = 0;
+		float speedSquared = 0.0f;
 
 		ObjectData()
 		{
@@ -2225,9 +2239,33 @@ void CloneManagerLocal::WriteUpdates()
 			auto entity = (fwEntity*)object->GetGameObject();
 			auto entityPos = entity->GetPosition();
 
+			// estimate speed from position deltas (sampled at most every 100ms to keep it stable)
+			if (objectData.lastSampleTime == 0 || ts < objectData.lastSampleTime)
+			{
+				objectData.lastSampleTime = ts;
+				objectData.lastSamplePos[0] = entityPos.x;
+				objectData.lastSamplePos[1] = entityPos.y;
+				objectData.lastSamplePos[2] = entityPos.z;
+			}
+			else if ((ts - objectData.lastSampleTime) >= 100)
+			{
+				const float dt = (ts - objectData.lastSampleTime) / 1000.0f;
+				const float dx = entityPos.x - objectData.lastSamplePos[0];
+				const float dy = entityPos.y - objectData.lastSamplePos[1];
+				const float dz = entityPos.z - objectData.lastSamplePos[2];
+
+				objectData.speedSquared = ((dx * dx) + (dy * dy) + (dz * dz)) / (dt * dt);
+				objectData.lastSampleTime = ts;
+				objectData.lastSamplePos[0] = entityPos.x;
+				objectData.lastSamplePos[1] = entityPos.y;
+				objectData.lastSamplePos[2] = entityPos.z;
+			}
+
 			if (!_isSphereVisibleForLocalPlayer(&entityPos, entity->GetRadius()) && !_isSphereVisibleForAnyRemotePlayer(&entityPos, entity->GetRadius(), 250.0f, nullptr))
 			{
-				syncLatency = 250ms;
+				// fast movers (e.g. NPC traffic) can come into view quickly, don't let them fall too far behind
+				constexpr float kFastEntitySpeed = 10.0f; // m/s
+				syncLatency = (objectData.speedSquared >= (kFastEntitySpeed * kFastEntitySpeed)) ? 100ms : 250ms;
 			}
 		}
 
@@ -2503,9 +2541,9 @@ void CloneManagerLocal::AttemptFlushAckBuffer()
 // maximum size of a compressed clone packet, keeping the routed packet below the default MTU (net_maxMtu 1300)
 static constexpr int kMaxCompressedPacketSize = 1100;
 
-uint32_t& CloneManagerLocal::GetLastCommandBoundary(rl::MessageBuffer& buffer)
+auto CloneManagerLocal::GetSendBufferState(rl::MessageBuffer& buffer) -> SendBufferState&
 {
-	return (&buffer == &m_ackBuffer) ? m_ackBufferBoundary : m_sendBufferBoundary;
+	return (&buffer == &m_ackBuffer) ? m_ackBufferState : m_sendBufferState;
 }
 
 int CloneManagerLocal::EstimateCompressedSize(rl::MessageBuffer& buffer)
@@ -2525,24 +2563,43 @@ int CloneManagerLocal::EstimateCompressedSize(rl::MessageBuffer& buffer)
 void CloneManagerLocal::AttemptFlushNetBuffer(rl::MessageBuffer& buffer, uint32_t msgType)
 {
 	// this gets called after every command written to the buffer, so the current bit is always a command boundary
-	auto& lastBoundary = GetLastCommandBoundary(buffer);
+	auto& state = GetSendBufferState(buffer);
+	auto& lastBoundary = state.lastBoundary;
 	const uint32_t currentBit = buffer.GetCurrentBit();
+	const size_t length = buffer.GetDataLength();
 
-	if (lastBoundary > currentBit)
+	if (lastBoundary > currentBit || state.estimatedAtLength > length)
 	{
-		lastBoundary = 0;
+		state = {};
 	}
 
 	// can't exceed the packet size even if incompressible
-	if (LZ4_compressBound(buffer.GetDataLength() + 1) <= kMaxCompressedPacketSize)
+	if (LZ4_compressBound(length + 1) <= kMaxCompressedPacketSize)
 	{
 		lastBoundary = currentBit;
 		return;
 	}
 
+	// bytes appended since the last estimate can't grow the compressed size by more than their own
+	// size (plus a little LZ4 framing), so skip re-compressing until that bound gets close to the limit
+	if (state.estimatedAtLength != 0)
+	{
+		const size_t addedBytes = length - state.estimatedAtLength;
+		const size_t upperBound = state.estimatedSize + addedBytes + (addedBytes / 255) + 16;
+
+		if (upperBound <= kMaxCompressedPacketSize)
+		{
+			lastBoundary = currentBit;
+			return;
+		}
+	}
+
 	// sync data usually compresses to ~50-70% with the dictionary, so only flush once the *compressed* packet is full
 	// (previously this flushed based on the uncompressed size, sending many half-empty packets)
-	if (EstimateCompressedSize(buffer) <= kMaxCompressedPacketSize)
+	state.estimatedSize = EstimateCompressedSize(buffer);
+	state.estimatedAtLength = length;
+
+	if (state.estimatedSize <= kMaxCompressedPacketSize)
 	{
 		lastBoundary = currentBit;
 		return;
@@ -2608,7 +2665,7 @@ void CloneManagerLocal::SendUpdates(rl::MessageBuffer& buffer, uint32_t msgType)
 #endif
 
 		buffer.SetCurrentBit(0);
-		GetLastCommandBoundary(buffer) = 0;
+		GetSendBufferState(buffer) = {};
 		*lastSendVar = msec();
 	}
 }

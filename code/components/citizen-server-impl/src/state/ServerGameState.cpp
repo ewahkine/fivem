@@ -120,10 +120,11 @@ static int g_oneSyncCullingHysteresis = 10;
 static std::shared_ptr<ConVar<int>> g_oneSyncOwnershipGraceVar;
 static int g_oneSyncOwnershipGrace = 500;
 
-// players and player-occupied vehicles are exempt from the out-of-view sync penalty and get a gentler distance falloff
+// minimum amount of times per second each client's relevancy gets recalculated (0: fixed batch size per tick)
 static std::shared_ptr<ConVar<int>> g_oneSyncRelevanceUpdateRateVar;
 static int g_oneSyncRelevanceUpdateRate = 0;
 
+// players and player-occupied vehicles are exempt from the out-of-view sync penalty and get a gentler distance falloff
 static std::shared_ptr<ConVar<bool>> g_oneSyncPrioritizePlayersVar;
 static bool g_oneSyncPrioritizePlayers = true;
 

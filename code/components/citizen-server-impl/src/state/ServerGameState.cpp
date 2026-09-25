@@ -111,6 +111,26 @@ static std::shared_ptr<ConVar<int>> g_requestControlSettleVar;
 static RequestControlFilterMode g_requestControlFilterState;
 static int g_requestControlSettleDelay;
 
+// extra radius (in percent) an already-created entity may travel beyond the culling radius before
+// it gets removed for a client, prevents create/delete (and migration) thrashing at the scope border
+static std::shared_ptr<ConVar<int>> g_oneSyncCullingHysteresisVar;
+static int g_oneSyncCullingHysteresis = 10;
+
+// time (in ms) the closest relevant client gets to claim an ownerless entity before any client may take it
+static std::shared_ptr<ConVar<int>> g_oneSyncOwnershipGraceVar;
+static int g_oneSyncOwnershipGrace = 500;
+
+// minimum amount of times per second each client's relevancy gets recalculated (0: fixed batch size per tick)
+static std::shared_ptr<ConVar<int>> g_oneSyncRelevanceUpdateRateVar;
+static int g_oneSyncRelevanceUpdateRate = 0;
+
+// players and player-occupied vehicles are exempt from the out-of-view sync penalty and get a gentler distance falloff
+static std::shared_ptr<ConVar<bool>> g_oneSyncPrioritizePlayersVar;
+static bool g_oneSyncPrioritizePlayers = true;
+
+// entities moving faster than this (in m/s) are exempt from the out-of-view sync penalty
+static constexpr float kFastEntitySpeed = 10.0f;
+
 static uint32_t MakeHandleUniqifierPair(uint16_t objectId, uint16_t uniqifier)
 {
 	return ((uint32_t)objectId << 16) | (uint32_t)uniqifier;
@@ -650,6 +670,86 @@ FocusResult GetPlayerFocusPos(const fx::sync::SyncEntityPtr& entity)
 	}
 }
 
+static float GetMinDistanceSquared(const FocusResult& focusPositions, const glm::vec3& pos)
+{
+	float dist = std::numeric_limits<float>::max();
+
+	for (const auto& focusPos : focusPositions)
+	{
+		dist = std::min(dist, glm::distance2(focusPos, pos));
+	}
+
+	return dist;
+}
+
+// returns whether no other relevant client is a better owner for this entity than `client`
+// (closest player wins, ties go to the lowest slot ID so all sync threads agree)
+static bool IsPreferredOwnerCandidate(fx::ServerGameState* sgs, fx::ClientRegistry* clientRegistry, const fx::sync::SyncEntityPtr& entity, const fx::ClientSharedPtr& client, const FocusResult& clientFocus, const fx::ClientSharedPtr& currentOwner)
+{
+	if (!entity->syncTree)
+	{
+		return true;
+	}
+
+	float position[3];
+	entity->syncTree->GetPosition(position);
+
+	const glm::vec3 entityPos{ position[0], position[1], position[2] };
+	const float ownDistance = GetMinDistanceSquared(clientFocus, entityPos);
+	const auto ownSlot = client->GetSlotId();
+
+	decltype(entity->relevantTo) candidates;
+
+	{
+		std::shared_lock _(entity->guidMutex);
+		candidates = entity->relevantTo;
+	}
+
+	for (auto bit = candidates.find_first(); bit != decltype(candidates)::kSize; bit = candidates.find_next(bit))
+	{
+		if (bit == ownSlot || (currentOwner && bit == currentOwner->GetSlotId()))
+		{
+			continue;
+		}
+
+		auto candidate = clientRegistry->GetClientBySlotID(bit);
+
+		// don't wait on clients that are timing out
+		if (!candidate || (msec() - candidate->GetLastSeen()) > 5s)
+		{
+			continue;
+		}
+
+		auto candidateData = GetClientDataUnlocked(sgs, candidate);
+
+		if (candidateData->routingBucket != entity->routingBucket)
+		{
+			continue;
+		}
+
+		fx::sync::SyncEntityPtr candidatePlayer;
+
+		{
+			std::shared_lock _lock(candidateData->playerEntityMutex);
+			candidatePlayer = candidateData->playerEntity.lock();
+		}
+
+		if (!candidatePlayer)
+		{
+			continue;
+		}
+
+		const float candidateDistance = GetMinDistanceSquared(GetPlayerFocusPos(candidatePlayer), entityPos);
+
+		if (candidateDistance < ownDistance || (candidateDistance == ownDistance && bit < ownSlot))
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
 ServerGameState::ServerGameState()
 	: m_frameIndex(1), m_entitiesById(MaxObjectId), m_entityLockdownMode(EntityLockdownMode::Inactive)
 {
@@ -914,7 +1014,8 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 		fx::sync::SyncEntityPtr,
 		glm::vec3,
 		sync::CVehicleGameStateNodeData*,
-		fx::ClientWeakPtr
+		fx::ClientWeakPtr,
+		float /* speed squared */
 	> relevantEntities[MaxObjectId + 1];
 
 	int maxValidEntity = 0;
@@ -990,7 +1091,14 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 				vehicleData = entity->syncTree->GetVehicleGameState();
 			}
 			
-			relevantEntities[maxValidEntity] = { entity, entityPosition, vehicleData, entity->GetClient() };
+			float speedSquared = 0.0f;
+
+			if (auto velocity = entity->syncTree->GetVelocity())
+			{
+				speedSquared = (velocity->velX * velocity->velX) + (velocity->velY * velocity->velY) + (velocity->velZ * velocity->velZ);
+			}
+
+			relevantEntities[maxValidEntity] = { entity, entityPosition, vehicleData, entity->GetClient(), speedSquared };
 			maxValidEntity++;
 		}
 	}
@@ -1003,7 +1111,20 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 	int iterations = 0;
 	int slot = lastUpdateSlot;
 	
-	while (iterations < ((fx::IsBigMode() ? 8 : 16) * tickMul))
+	int clientsPerTick = (fx::IsBigMode() ? 8 : 16) * tickMul;
+
+	// optionally scale the batch size with the player count so every client's relevancy (and sync rate tiers)
+	// gets refreshed at least N times per second, instead of every ~0.6s with 200 players
+	if (g_oneSyncRelevanceUpdateRate > 0)
+	{
+		const int connectedClients = static_cast<int>(creg->GetAmountOfConnectedClients());
+		const int neededPerTick = ((connectedClients * g_oneSyncRelevanceUpdateRate) + effectiveTicksPerSecond - 1) / effectiveTicksPerSecond;
+
+		// cap it, as this loop is single-threaded and scales with (clients * entities)
+		clientsPerTick = std::clamp(neededPerTick, clientsPerTick, clientsPerTick * 4);
+	}
+
+	while (iterations < clientsPerTick)
 	{
 		iterations++;
 
@@ -1053,7 +1174,7 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 
 		for (int entityIndex = 0; entityIndex < maxValidEntity; entityIndex++)
 		{
-			const auto& [entity, entityPos, vehicleData, entityClientWeak] = relevantEntities[entityIndex];
+			const auto& [entity, entityPos, vehicleData, entityClientWeak, entitySpeedSquared] = relevantEntities[entityIndex];
 			auto entityClient = entityClientWeak.lock();
 			auto ownsEntity = entityClient && entityClient->GetNetId() == client->GetNetId();
 
@@ -1066,6 +1187,18 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 			}
 			
 			bool isRelevant = (g_oneSyncCulling->GetValue()) ? false : true;
+
+			auto entIdentifier = MakeHandleUniqifierPair(entity->handle, entity->uniqifier);
+			auto currentSyncIt = currentSyncedEntities.find(entIdentifier);
+
+			// entities that already exist for this client use a slightly larger radius to leave scope (hysteresis)
+			float cullingRadiusScale = 1.0f;
+
+			if (currentSyncIt != currentSyncedEntities.end() && g_oneSyncCullingHysteresis > 0)
+			{
+				const float hysteresis = 1.0f + (std::min(g_oneSyncCullingHysteresis, 100) / 100.0f);
+				cullingRadiusScale = hysteresis * hysteresis; // culling radii are squared
+			}
 
 			if (ownsEntity && entity->type == fx::sync::NetObjEntityType::Player)
 			{
@@ -1082,7 +1215,7 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 						float diffY = entityPos.y - playerPos.y;
 
 						float distSquared = (diffX * diffX) + (diffY * diffY);
-						if (distSquared < entity->GetDistanceCullingRadius(clientDataUnlocked->GetPlayerCullingRadius()))
+						if (distSquared < entity->GetDistanceCullingRadius(clientDataUnlocked->GetPlayerCullingRadius()) * cullingRadiusScale)
 						{
 							return true;
 						}
@@ -1216,6 +1349,11 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 				// we want to reassign to someone else ASAP
 				else
 				{
+					if (!entity->wantsReassign)
+					{
+						entity->reassignRequestedAt = msec();
+					}
+
 					entity->wantsReassign = true;
 
 					// but don't force it to exist for ourselves if it's not script-owned
@@ -1237,7 +1375,7 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 				// ... or if it's currently created for us (as otherwise relevantTo won't clear as we never get a delete)
 				if (!shouldDelete)
 				{
-					if (auto syncIt = currentSyncedEntities.find(MakeHandleUniqifierPair(entity->handle, entity->uniqifier)); syncIt != currentSyncedEntities.end())
+					if (auto syncIt = currentSyncIt; syncIt != currentSyncedEntities.end())
 					{
 						auto& entityData = syncIt->second;
 
@@ -1265,6 +1403,11 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 			// only update sync delay if should-be-created
 			// isRelevant should **not** be updated after this
 			auto syncDelay = 50ms;
+
+			// players and vehicles with players in them are what people look at the most
+			const bool isPriorityEntity = g_oneSyncPrioritizePlayers &&
+				(entity->type == sync::NetObjEntityType::Player || (vehicleData && vehicleData->playerOccupants.any()));
+
 			if (isRelevant && g_oneSyncRadiusFrequency->GetValue() && !isPlayerOrVehicle)
 			{
 				const auto& position = entityPos;
@@ -1291,28 +1434,25 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 						break;
 					}
 
-					if (!IsInFrustum(position, objRadius, clientDataUnlocked->viewMatrix))
+					// fast-moving entities (e.g. traffic behind the camera) would visibly stutter once the camera turns
+					const bool isFastMoving = entitySpeedSquared >= (kFastEntitySpeed * kFastEntitySpeed);
+
+					if (!isPriorityEntity && !isFastMoving && !IsInFrustum(position, objRadius, clientDataUnlocked->viewMatrix))
 					{
 						syncDelay = 150ms;
 					}
 
 					if (playerEntity)
 					{
-						float dist = std::numeric_limits<float>::max();
-
-						for (const auto& playerPos : playerPosns)
-						{
-							auto thisDist = glm::distance2(position, playerPos);
-							dist = std::min(thisDist, dist);
-						}
+						const float dist = GetMinDistanceSquared(playerPosns, position);
 
 						if (dist > 500.0f * 500.0f)
 						{
-							syncDelay = 500ms;
+							syncDelay = (isPriorityEntity) ? 150ms : 500ms;
 						}
 						else if (dist > 250.0f * 250.0f)
 						{
-							syncDelay = 250ms;
+							syncDelay = (isPriorityEntity) ? 100ms : 250ms;
 						}
 						else if (dist < 35.0f * 35.0f)
 						{
@@ -1325,25 +1465,15 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 			{
 				if (playerEntity)
 				{
-					float dist = std::numeric_limits<float>::max();
-
-					for (const auto& playerPos : playerPosns)
-					{
-						auto thisDist = glm::distance2(entityPos, playerPos);
-						dist = std::min(thisDist, dist);
-					}
-
-					if (dist < 35.0f * 35.0f)
+					if (GetMinDistanceSquared(playerPosns, entityPos) < 35.0f * 35.0f)
 					{
 						syncDelay /= 4;
 					}
 				}
 			}
 
-			auto entIdentifier = MakeHandleUniqifierPair(entity->handle, entity->uniqifier);
-
 			// already syncing
-			if (auto syncIt = currentSyncedEntities.find(entIdentifier); syncIt != currentSyncedEntities.end())
+			if (auto syncIt = currentSyncIt; syncIt != currentSyncedEntities.end())
 			{
 				auto& entityData = syncIt->second;
 				if (isRelevant)
@@ -1625,12 +1755,36 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 			// relevant entity owned by nobody, or wants a reassign? try to yoink it
 			// (abuse clientMutex for wantsReassign safety)
 			{
-				std::unique_lock _(entity->clientMutex);
-				auto cl = entity->GetClientUnsafe().lock();
-				if (!cl || (entity->wantsReassign && cl->GetNetId() != client->GetNetId()))
+				auto needsReassign = [&entity, &client](const fx::ClientSharedPtr& cl)
 				{
-					entity->wantsReassign = false;
-					ReassignEntity(entity->handle, client, std::move(_)); // transfer the lock inside
+					return !cl || (entity->wantsReassign && cl->GetNetId() != client->GetNetId());
+				};
+
+				// cheap check under a shared lock first, as this runs for every synced entity on every client thread
+				bool mayReassign = false;
+
+				{
+					std::shared_lock _(entity->clientMutex);
+					mayReassign = needsReassign(entity->GetClientUnsafe().lock());
+				}
+
+				if (mayReassign)
+				{
+					std::unique_lock _(entity->clientMutex);
+					auto cl = entity->GetClientUnsafe().lock();
+
+					if (needsReassign(cl))
+					{
+						// give the closest relevant client a chance to take this entity first,
+						// only fall back to 'whoever gets here first' after the grace period
+						const bool graceExpired = (curTime - entity->reassignRequestedAt) >= std::chrono::milliseconds{ g_oneSyncOwnershipGrace };
+
+						if (graceExpired || IsPreferredOwnerCandidate(this, clientRegistry.GetRef(), entity, client, playerPosns, cl))
+						{
+							entity->wantsReassign = false;
+							ReassignEntity(entity->handle, client, std::move(_)); // transfer the lock inside
+						}
+					}
 				}
 			}
 
@@ -1979,7 +2133,7 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 			{
 				size_t thisMaxBacklog = maxSavedClientFrames;
 
-				if (client->GetLastSeen() > 5s)
+				if ((msec() - client->GetLastSeen()) > 5s)
 				{
 					thisMaxBacklog = maxSavedClientFramesWorstCase;
 				}
@@ -2559,6 +2713,11 @@ void ServerGameState::ReassignEntityInner(uint32_t entityHandle, const fx::Clien
 	{
 		entity->lastMigratedAt = msec();
 
+		if (!targetClient)
+		{
+			entity->reassignRequestedAt = entity->lastMigratedAt;
+		}
+
 		entity->GetLastOwnerUnsafe() = oldClientRef;
 		entity->GetClientUnsafe() = targetClient;
 
@@ -2802,7 +2961,6 @@ bool ServerGameState::MoveEntityToCandidate(const fx::sync::SyncEntityPtr& entit
 
 		uint32_t eh = entity->handle;
 		auto candidateSet = entity->relevantTo;
-		constexpr auto maxCandidates = 5;
 
 		if (entity->type != sync::NetObjEntityType::Player)
 		{
@@ -2810,7 +2968,8 @@ bool ServerGameState::MoveEntityToCandidate(const fx::sync::SyncEntityPtr& entit
 			{
 				auto tgtClient = clientRegistry->GetClientBySlotID(bit);
 
-				if (!tgtClient || tgtClient == client)
+				// don't hand entities to clients that are timing out themselves
+				if (!tgtClient || tgtClient == client || (msec() - tgtClient->GetLastSeen()) > 5s)
 				{
 					continue;
 				}
@@ -2830,16 +2989,12 @@ bool ServerGameState::MoveEntityToCandidate(const fx::sync::SyncEntityPtr& entit
 
 					if (pos.x != 0.0f && !tgts.empty())
 					{
-						distance = glm::distance2(tgts[0], pos);
+						distance = GetMinDistanceSquared(tgts, pos);
 					}
 				}
 
+				// consider every relevant client, not just the first few by slot ID, so the closest one wins
 				candidates.emplace(distance, tgtClient);
-
-				if (candidates.size() >= maxCandidates)
-				{
-					break;
-				}
 			}
 		}
 
@@ -3298,6 +3453,7 @@ auto ServerGameState::CreateEntityFromTree(sync::NetObjEntityType type, const st
 	entity->uniqifier = rand();
 	entity->creationToken = msec().count();
 	entity->createdAt = msec();
+	entity->reassignRequestedAt = entity->createdAt;
 	entity->passedFilter = true;
 
 	entity->syncTree = tree;
@@ -7847,6 +8003,11 @@ static InitFunction initFunction([]()
 
 		g_requestControlVar = instance->AddVariable<int>("sv_filterRequestControl", ConVar_None, (int)RequestControlFilterMode::NoFilter, (int*)&g_requestControlFilterState);
 		g_requestControlSettleVar = instance->AddVariable<int>("sv_filterRequestControlSettleTimer", ConVar_None, 30000, &g_requestControlSettleDelay);
+
+		g_oneSyncCullingHysteresisVar = instance->AddVariable<int>("onesync_distanceCullingHysteresis", ConVar_None, 10, &g_oneSyncCullingHysteresis);
+		g_oneSyncOwnershipGraceVar = instance->AddVariable<int>("onesync_ownershipCandidateGrace", ConVar_None, 500, &g_oneSyncOwnershipGrace);
+		g_oneSyncRelevanceUpdateRateVar = instance->AddVariable<int>("onesync_relevanceUpdateRate", ConVar_None, 0, &g_oneSyncRelevanceUpdateRate);
+		g_oneSyncPrioritizePlayersVar = instance->AddVariable<bool>("onesync_prioritizePlayers", ConVar_None, true, &g_oneSyncPrioritizePlayers);
 
 		fx::SetOneSyncGetCallback([]()
 		{

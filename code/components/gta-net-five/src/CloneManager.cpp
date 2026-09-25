@@ -17,6 +17,8 @@
 #include <netSyncTree.h>
 #include <netTimeSync.h>
 
+#define LZ4_STATIC_LINKING_ONLY
+#define LZ4_HC_STATIC_LINKING_ONLY
 #include <lz4hc.h>
 
 #include <boost/range/adaptor/map.hpp>
@@ -177,6 +179,20 @@ private:
 
 	void AttemptFlushNetBuffer(rl::MessageBuffer& buffer, uint32_t msgType);
 
+	int EstimateCompressedSize(rl::MessageBuffer& buffer);
+
+	struct SendBufferState
+	{
+		// bit offset of the end of the last command known to fit in a single packet
+		uint32_t lastBoundary = 0;
+
+		// uncompressed length and estimated compressed size at the last estimate
+		size_t estimatedAtLength = 0;
+		int estimatedSize = 0;
+	};
+
+	SendBufferState& GetSendBufferState(rl::MessageBuffer& buffer);
+
 	void AttemptFlushCloneBuffer();
 
 	void AttemptFlushAckBuffer();
@@ -213,6 +229,9 @@ private:
 	rl::MessageBuffer m_sendBuffer{ 16384 };
 	rl::MessageBuffer m_ackBuffer{ 16384 };
 
+	SendBufferState m_sendBufferState;
+	SendBufferState m_ackBufferState;
+
 	uint32_t m_ackTimestamp{ 0 };
 
 private:
@@ -227,6 +246,11 @@ private:
 		std::shared_ptr<fx::StateBag> stateBag;
 		uint64_t lastFrameUpdated = 0;
 		bool hi = false;
+
+		// sampled position, used to estimate the entity's speed for sync rate decisions
+		float lastSamplePos[3] = { 0.0f, 0.0f, 0.0f };
+		uint32_t lastSampleTime = 0;
+		float speedSquared = 0.0f;
 
 		ObjectData()
 		{
@@ -257,7 +281,14 @@ private:
 	};
 
 private:
+	// dictionary streams are prepared once and attached to the working streams per packet
+	// (copying the ~256 KiB HC stream for every packet is way more expensive than compressing the packet itself)
 	LZ4_streamHC_t m_compStreamDict;
+	LZ4_streamHC_t m_compStream;
+
+	// fast LZ4 is used to cheaply estimate the compressed size of a pending packet
+	LZ4_stream_t m_estimateStreamDict;
+	LZ4_stream_t m_estimateStream;
 
 	std::unordered_map<int, ObjectData> m_trackedObjects;
 
@@ -461,6 +492,11 @@ void CloneManagerLocal::BindNetLibrary(NetLibrary* netLibrary)
 	};
 
 	LZ4_loadDictHC(&m_compStreamDict, reinterpret_cast<const char*>(dictBuffer), std::size(dictBuffer));
+	LZ4_initStreamHC(&m_compStream, sizeof(m_compStream));
+
+	LZ4_initStream(&m_estimateStreamDict, sizeof(m_estimateStreamDict));
+	LZ4_loadDict(&m_estimateStreamDict, reinterpret_cast<const char*>(dictBuffer), std::size(dictBuffer));
+	LZ4_initStream(&m_estimateStream, sizeof(m_estimateStream));
 }
 
 void CloneManagerLocal::Reset()
@@ -2203,9 +2239,33 @@ void CloneManagerLocal::WriteUpdates()
 			auto entity = (fwEntity*)object->GetGameObject();
 			auto entityPos = entity->GetPosition();
 
+			// estimate speed from position deltas (sampled at most every 100ms to keep it stable)
+			if (objectData.lastSampleTime == 0 || ts < objectData.lastSampleTime)
+			{
+				objectData.lastSampleTime = ts;
+				objectData.lastSamplePos[0] = entityPos.x;
+				objectData.lastSamplePos[1] = entityPos.y;
+				objectData.lastSamplePos[2] = entityPos.z;
+			}
+			else if ((ts - objectData.lastSampleTime) >= 100)
+			{
+				const float dt = (ts - objectData.lastSampleTime) / 1000.0f;
+				const float dx = entityPos.x - objectData.lastSamplePos[0];
+				const float dy = entityPos.y - objectData.lastSamplePos[1];
+				const float dz = entityPos.z - objectData.lastSamplePos[2];
+
+				objectData.speedSquared = ((dx * dx) + (dy * dy) + (dz * dz)) / (dt * dt);
+				objectData.lastSampleTime = ts;
+				objectData.lastSamplePos[0] = entityPos.x;
+				objectData.lastSamplePos[1] = entityPos.y;
+				objectData.lastSamplePos[2] = entityPos.z;
+			}
+
 			if (!_isSphereVisibleForLocalPlayer(&entityPos, entity->GetRadius()) && !_isSphereVisibleForAnyRemotePlayer(&entityPos, entity->GetRadius(), 250.0f, nullptr))
 			{
-				syncLatency = 250ms;
+				// fast movers (e.g. NPC traffic) can come into view quickly, don't let them fall too far behind
+				constexpr float kFastEntitySpeed = 10.0f; // m/s
+				syncLatency = (objectData.speedSquared >= (kFastEntitySpeed * kFastEntitySpeed)) ? 100ms : 250ms;
 			}
 		}
 
@@ -2318,10 +2378,10 @@ void CloneManagerLocal::WriteUpdates()
 
 			if (shouldTrySend)
 			{
-				// #TODO1S: dynamic resend time based on latency
+				// don't resend unchanged data before an ack could have arrived (40-100ms depending on latency)
 				bool shouldWrite = true;
 
-				if ((lastChangeTime == objectData.lastChangeTime || syncType == 1) && ts < (objectData.lastResendTime + std::min(40, std::max(100, m_netLibrary->GetPing() + (m_netLibrary->GetVariance() * 4)))))
+				if ((lastChangeTime == objectData.lastChangeTime || syncType == 1) && ts < (objectData.lastResendTime + std::clamp(m_netLibrary->GetPing() + (m_netLibrary->GetVariance() * 4), 40, 100)))
 				{
 					Log("%s: no early resend of object [obj:%d]\n", __func__, objectId);
 					shouldWrite = false;
@@ -2478,13 +2538,94 @@ void CloneManagerLocal::AttemptFlushAckBuffer()
 	}
 }
 
+// maximum size of a compressed clone packet, keeping the routed packet below the default MTU (net_maxMtu 1300)
+static constexpr int kMaxCompressedPacketSize = 1100;
+
+auto CloneManagerLocal::GetSendBufferState(rl::MessageBuffer& buffer) -> SendBufferState&
+{
+	return (&buffer == &m_ackBuffer) ? m_ackBufferState : m_sendBufferState;
+}
+
+int CloneManagerLocal::EstimateCompressedSize(rl::MessageBuffer& buffer)
+{
+	static std::vector<char> scratch(LZ4_compressBound(16384));
+
+	LZ4_resetStream_fast(&m_estimateStream);
+	LZ4_attach_dictionary(&m_estimateStream, &m_estimateStreamDict);
+
+	// +1 for the end-of-packet marker SendUpdates appends
+	int len = LZ4_compress_fast_continue(&m_estimateStream, reinterpret_cast<const char*>(buffer.GetBuffer().data()), scratch.data(), buffer.GetDataLength() + 1, scratch.size(), 1);
+
+	// fast mode compresses worse than HC, so this is a (practically) safe upper bound
+	return (len > 0) ? len : LZ4_compressBound(buffer.GetDataLength() + 1);
+}
+
 void CloneManagerLocal::AttemptFlushNetBuffer(rl::MessageBuffer& buffer, uint32_t msgType)
 {
-	// flush the send buffer in case it could compress to >1100 bytes
-	if (LZ4_compressBound(buffer.GetDataLength()) > 1100)
+	// this gets called after every command written to the buffer, so the current bit is always a command boundary
+	auto& state = GetSendBufferState(buffer);
+	auto& lastBoundary = state.lastBoundary;
+	const uint32_t currentBit = buffer.GetCurrentBit();
+	const size_t length = buffer.GetDataLength();
+
+	if (lastBoundary > currentBit || state.estimatedAtLength > length)
+	{
+		state = {};
+	}
+
+	// can't exceed the packet size even if incompressible
+	if (LZ4_compressBound(length + 1) <= kMaxCompressedPacketSize)
+	{
+		lastBoundary = currentBit;
+		return;
+	}
+
+	// bytes appended since the last estimate can't grow the compressed size by more than their own
+	// size (plus a little LZ4 framing), so skip re-compressing until that bound gets close to the limit
+	if (state.estimatedAtLength != 0)
+	{
+		const size_t addedBytes = length - state.estimatedAtLength;
+		const size_t upperBound = state.estimatedSize + addedBytes + (addedBytes / 255) + 16;
+
+		if (upperBound <= kMaxCompressedPacketSize)
+		{
+			lastBoundary = currentBit;
+			return;
+		}
+	}
+
+	// sync data usually compresses to ~50-70% with the dictionary, so only flush once the *compressed* packet is full
+	// (previously this flushed based on the uncompressed size, sending many half-empty packets)
+	state.estimatedSize = EstimateCompressedSize(buffer);
+	state.estimatedAtLength = length;
+
+	if (state.estimatedSize <= kMaxCompressedPacketSize)
+	{
+		lastBoundary = currentBit;
+		return;
+	}
+
+	// a single command that's too large on its own, nothing we can do but send it
+	if (lastBoundary == 0)
 	{
 		SendUpdates(buffer, msgType);
+		return;
 	}
+
+	// send everything up to the last command that fit, and carry the newest command over to the next packet
+	const uint32_t carryBits = currentBit - lastBoundary;
+	std::vector<uint8_t> carry((carryBits / 8) + 2);
+
+	buffer.SetCurrentBit(lastBoundary);
+	buffer.ReadBits(carry.data(), carryBits);
+	buffer.SetCurrentBit(lastBoundary);
+
+	SendUpdates(buffer, msgType);
+
+	buffer.WriteBits(carry.data(), carryBits);
+
+	// the carried command might be large enough to need flushing by itself
+	AttemptFlushNetBuffer(buffer, msgType);
 }
 
 void CloneManagerLocal::SendUpdates(rl::MessageBuffer& buffer, uint32_t msgType)
@@ -2500,10 +2641,11 @@ void CloneManagerLocal::SendUpdates(rl::MessageBuffer& buffer, uint32_t msgType)
 		int len = 0;
 
 		// see https://github.com/lz4/lz4/issues/399#issuecomment-329337170
-		LZ4_streamHC_t compStream;
-		memcpy(&compStream, &m_compStreamDict, sizeof(compStream));
+		// attaching the dictionary avoids copying the whole (~256 KiB) dictionary stream for every packet
+		LZ4_resetStreamHC_fast(&m_compStream, LZ4HC_CLEVEL_DEFAULT);
+		LZ4_attach_HC_dictionary(&m_compStream, &m_compStreamDict);
 
-		len = LZ4_compress_HC_continue(&compStream, reinterpret_cast<const char*>(buffer.GetBuffer().data()), outData.data() + 4, buffer.GetDataLength(), outData.size() - 4);
+		len = LZ4_compress_HC_continue(&m_compStream, reinterpret_cast<const char*>(buffer.GetBuffer().data()), outData.data() + 4, buffer.GetDataLength(), outData.size() - 4);
 
 		Log("compressed %d bytes to %d bytes\n", buffer.GetDataLength(), len);
 
@@ -2523,6 +2665,7 @@ void CloneManagerLocal::SendUpdates(rl::MessageBuffer& buffer, uint32_t msgType)
 #endif
 
 		buffer.SetCurrentBit(0);
+		GetSendBufferState(buffer) = {};
 		*lastSendVar = msec();
 	}
 }

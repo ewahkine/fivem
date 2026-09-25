@@ -932,6 +932,10 @@ struct SyncEntityState
 	std::chrono::milliseconds lastReceivedAt;
 	std::chrono::milliseconds lastMigratedAt;
 
+	// time at which this entity started looking for a new owner (unowned, or owner wants to hand it off)
+	// used to give the closest relevant client a head start before any client may take it
+	std::chrono::milliseconds reassignRequestedAt{ 0 };
+
 	std::shared_ptr<SyncTreeBase> syncTree;
 
 	ScriptGuid* guid = nullptr;

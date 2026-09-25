@@ -2318,10 +2318,10 @@ void CloneManagerLocal::WriteUpdates()
 
 			if (shouldTrySend)
 			{
-				// #TODO1S: dynamic resend time based on latency
+				// don't resend unchanged data before an ack could have arrived (40-100ms depending on latency)
 				bool shouldWrite = true;
 
-				if ((lastChangeTime == objectData.lastChangeTime || syncType == 1) && ts < (objectData.lastResendTime + std::min(40, std::max(100, m_netLibrary->GetPing() + (m_netLibrary->GetVariance() * 4)))))
+				if ((lastChangeTime == objectData.lastChangeTime || syncType == 1) && ts < (objectData.lastResendTime + std::clamp(m_netLibrary->GetPing() + (m_netLibrary->GetVariance() * 4), 40, 100)))
 				{
 					Log("%s: no early resend of object [obj:%d]\n", __func__, objectId);
 					shouldWrite = false;

@@ -121,6 +121,9 @@ static std::shared_ptr<ConVar<int>> g_oneSyncOwnershipGraceVar;
 static int g_oneSyncOwnershipGrace = 500;
 
 // players and player-occupied vehicles are exempt from the out-of-view sync penalty and get a gentler distance falloff
+static std::shared_ptr<ConVar<int>> g_oneSyncRelevanceUpdateRateVar;
+static int g_oneSyncRelevanceUpdateRate = 0;
+
 static std::shared_ptr<ConVar<bool>> g_oneSyncPrioritizePlayersVar;
 static bool g_oneSyncPrioritizePlayers = true;
 
@@ -1107,7 +1110,20 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 	int iterations = 0;
 	int slot = lastUpdateSlot;
 	
-	while (iterations < ((fx::IsBigMode() ? 8 : 16) * tickMul))
+	int clientsPerTick = (fx::IsBigMode() ? 8 : 16) * tickMul;
+
+	// optionally scale the batch size with the player count so every client's relevancy (and sync rate tiers)
+	// gets refreshed at least N times per second, instead of every ~0.6s with 200 players
+	if (g_oneSyncRelevanceUpdateRate > 0)
+	{
+		const int connectedClients = static_cast<int>(creg->GetAmountOfConnectedClients());
+		const int neededPerTick = ((connectedClients * g_oneSyncRelevanceUpdateRate) + effectiveTicksPerSecond - 1) / effectiveTicksPerSecond;
+
+		// cap it, as this loop is single-threaded and scales with (clients * entities)
+		clientsPerTick = std::clamp(neededPerTick, clientsPerTick, clientsPerTick * 4);
+	}
+
+	while (iterations < clientsPerTick)
 	{
 		iterations++;
 
@@ -7989,6 +8005,7 @@ static InitFunction initFunction([]()
 
 		g_oneSyncCullingHysteresisVar = instance->AddVariable<int>("onesync_distanceCullingHysteresis", ConVar_None, 10, &g_oneSyncCullingHysteresis);
 		g_oneSyncOwnershipGraceVar = instance->AddVariable<int>("onesync_ownershipCandidateGrace", ConVar_None, 500, &g_oneSyncOwnershipGrace);
+		g_oneSyncRelevanceUpdateRateVar = instance->AddVariable<int>("onesync_relevanceUpdateRate", ConVar_None, 0, &g_oneSyncRelevanceUpdateRate);
 		g_oneSyncPrioritizePlayersVar = instance->AddVariable<bool>("onesync_prioritizePlayers", ConVar_None, true, &g_oneSyncPrioritizePlayers);
 
 		fx::SetOneSyncGetCallback([]()
